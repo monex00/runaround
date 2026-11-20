@@ -1,0 +1,46 @@
+[project]
+name = "runaround"
+version = "0.1.0"
+description = "Newspaper text that reflows, frame by frame, around an animated figure cut out of its background: a reactive marimo notebook"
+requires-python = ">=3.12"
+dependencies = [
+    "marimo>=0.25.0",
+    "numpy>=2.5",
+    "pillow>=11",
+    "scipy>=1.18",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.16", "matplotlib>=3.11"]
+# Only for tools/masks.py, tools/render.py and cutout.py: segmentation models
+# on a GPU, the box drawer, an ffmpeg for machines without one.
+reels = [
+    "rembg[gpu]>=2.0.60",
+    "ultralytics>=8.3",
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "anywidget>=0.9",
+    "imageio-ffmpeg>=0.6",
+]
+
+[[tool.uv.index]]
+# CUDA 13 wheels: onnxruntime-gpu borrows torch's CUDA DLLs (tools/masks.py)
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# marimo writes `return` at the end of every cell and shows a cell's last
+# expression (B018); dict(...) is the house style
+ignore = ["PLR1711", "C408", "B018"]

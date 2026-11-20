@@ -1,0 +1,25 @@
+{
+  "title": "Spring",
+  "credit": "Spring, Blender Studio (2019), CC-BY 4.0, studio.blender.org",
+  "fps": 12.0,
+  "place": {
+    "scale": 1.25,
+    "cx": 0.5,
+    "bottom": 0.8
+  },
+  "look": {
+    "palette": "paper",
+    "grain": 0.015,
+    "grain_figure": 0.045,
+    "grain_size": 0.7,
+    "misregister": 1.5,
+    "soften": 0.4,
+    "figure": "colour",
+    "highlight": "#f2d94e",
+    "ink_white": 0.8,
+    "ink_black": 0.12
+  },
+  "text": "spring.txt",
+  "frames": 108,
+  "window": 0
+}

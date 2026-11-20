@@ -1,0 +1,89 @@
+# The series. One [[piece]] per reel.
+#
+# slug     : file names in out/ and the render.py argument
+# title    : the name in the caption
+# clip     : file in clips/ (never committed), masks in masks/<clip stem>/
+# start/end: seconds of the clip to use
+# text     : file in texts/ with the body text (public domain or own)
+# palette  : "paper" or "night"
+# seed     : seed of every random source of the piece (same seed, same reel)
+#
+# Placeholders until phase 4. Then each piece gets its overrides of the
+# dataclass defaults, with the same names as the fields:
+#   [piece.page]       columns, margins, line height
+#   [piece.runaround]  margin around the figure, min span, smoothing
+#   [piece.type]       body font and size, breaking mode, drop cap
+#   [piece.place]      where the clip sits on the page
+#   [piece.look]       grain, misregistration, softness
+
+[[piece]]
+slug = "spring"
+title = "Spring"
+clip = "spring.mkv"  # "Spring", Blender Studio 2019, CC-BY 4.0, credit studio.blender.org
+start = 385.5  # 6:25.5, girl and dog on the rock, mountains behind (one shot 381.79-394.54);
+#               before 6:25.5 the blurred girl entering the frame defeats BiRefNet
+end = 394.5  # 6:34.5, just before the cut; the dog jumps at 6:33.4
+text = "spring.txt"
+palette = "paper"
+seed = 1
+
+[piece.look]  # grain and plates of cheap print
+grain = 0.015
+grain_figure = 0.045
+grain_size = 0.7
+misregister = 1.5
+soften = 0.4
+
+[[piece]]
+slug = "fox"
+title = "Fox"
+clip = "fox"  # RGBA PNGs rendered from figures/fox (HyperFrames), our own drawing
+start = 0.0
+end = 6.0  # trots in, sniffs, looks up, leaps, bolts away
+text = "spring.txt"  # placeholder: same text as Spring for the test
+palette = "paper"
+seed = 3
+
+[piece.place]  # the frames are already page-sized
+scale = 1.0
+cx = 0.5
+bottom = 1.0
+
+[piece.look]
+grain = 0.015
+grain_figure = 0.045
+grain_size = 0.7
+misregister = 1.5
+soften = 0.4
+
+[[piece]]
+slug = "tango"
+title = "Tango"
+clip = "gallopin_gaucho_1928.mp4"  # The Gallopin' Gaucho (1928), US public domain, archive.org/details/the-gallopin-gaucho-1928
+start = 89.0  # 1:29, they rise from the dip (tango shot 80.62-101.52 s)
+end = 103.55  # 1:43.55: spin (after the cut at 101.52), then her arm up to the wall (cut at 103.02); the claw enters at 1:43.6
+text = "love.txt"
+palette = "paper"
+seed = 4
+
+[piece.cutout]  # black outlines on a light wall: recover legs, tails, white gloves
+ink = 0.35
+ink_reach = 60  # the model loses whole legs in some frames: take ink from further away
+ink_close = 5
+solidify = 14  # the text sees a whole figure even where the model broke it
+hold = 2  # and frames where the model failed borrow from their neighbours
+
+[piece.place]  # 1286x1080 clip, the dancers fill most of its height
+scale = 1.0
+cx = 0.5
+bottom = 0.80
+
+[piece.look]
+grain = 0.015
+grain_figure = 0.045
+grain_size = 0.7
+misregister = 1.5
+soften = 0.4
+figure = "ink"  # black-and-white line art printed like the text
+ink_white = 0.58  # the wall is 0.61-0.68 grey: it becomes paper
+
