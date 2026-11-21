@@ -168,3 +168,33 @@ def test_shot_picker_cuts_and_first_selection():
     assert default_shot([2.0, 7.25], 10.0, scan) == (2.0, 5.0)
     assert default_shot([4.03], 5.0, scan) == (0.0, 3.0)
     assert default_shot([1.0, 2.84], 3.0, scan) == (1.0, 2.8)
+
+
+def test_video_arrives_in_pieces(tmp_path):
+    """The upload writes each piece to disk, refuses one out of order, and a
+    different video with the same name does not take the first one's place."""
+    pytest.importorskip("anywidget")
+    from cutout import Scan, VideoDrop
+
+    drop = VideoDrop(tmp_path, Scan())
+    sent = []
+    drop.send = lambda msg, buffers=None: sent.append(msg)
+    drop._on_piece(drop, {"kind": "start", "name": "My Clip.MP4", "size": 6}, [])
+    assert sent[-1] == {"kind": "next", "at": 0}
+    drop._on_piece(drop, {"kind": "piece", "at": 3}, [b"xxx"])
+    assert sent[-1]["kind"] == "error"
+    drop._on_piece(drop, {"kind": "piece", "at": 0}, [b"abc"])
+    drop._on_piece(drop, {"kind": "end"}, [])
+    assert sent[-1]["kind"] == "error"  # only half of it has arrived
+    drop._on_piece(drop, {"kind": "piece", "at": 3}, [b"def"])
+    drop._on_piece(drop, {"kind": "end"}, [])
+    first = tmp_path / "my_clip" / "source.mp4"
+    assert sent[-1] == {"kind": "saved", "path": str(first)}
+    assert first.read_bytes() == b"abcdef"
+    drop._on_piece(drop, {"kind": "start", "name": "my clip.mp4", "size": 2}, [])
+    drop._on_piece(drop, {"kind": "piece", "at": 0}, [b"zz"])
+    drop._on_piece(drop, {"kind": "end"}, [])
+    assert sent[-1]["path"] == str(tmp_path / "my_clip_2" / "source.mp4")
+    assert first.read_bytes() == b"abcdef"
+    drop._on_piece(drop, {"kind": "start", "name": "notes.txt", "size": 2}, [])
+    assert sent[-1]["kind"] == "error"

@@ -142,11 +142,7 @@ def _(mo):
 @app.cell
 def _(mo):
     _local = sorted(p.name for p in CLIPS.iterdir() if p.is_file()) if CLIPS.exists() else []
-    video_upload = mo.ui.file(
-        filetypes=[".mp4", ".mov", ".mkv", ".webm"],
-        max_size=500_000_000,
-        label="a video",
-    )
+    video_upload = mo.ui.anywidget(VideoDrop(WORK, Scan()))
     video_pick = mo.ui.dropdown(
         ["", *_local], value="", label="or one from clips/" if _local else "(no clips/ here)"
     )
@@ -156,8 +152,8 @@ def _(mo):
     )
     mo.vstack(
         [
-            mo.hstack([video_upload, video_pick], justify="start"),
-            mo.hstack([fps, width], justify="start"),
+            video_upload,
+            mo.hstack([video_pick, fps, width] if _local else [fps, width], justify="start"),
         ]
     )
     return fps, video_pick, video_upload, width
@@ -166,12 +162,9 @@ def _(mo):
 @app.cell
 def _(mo, video_pick, video_upload):
     # The source video on disk (an upload is kept in masks/cutout/<name>/).
-    if video_upload.value:
-        name = slug(Path(video_upload.name()).stem)
-        (WORK / name).mkdir(parents=True, exist_ok=True)
-        source = WORK / name / f"source{Path(video_upload.name()).suffix.lower()}"
-        if not source.exists() or source.stat().st_size != len(video_upload.contents()):
-            source.write_bytes(video_upload.contents())
+    if video_upload.value["path"]:
+        source = Path(video_upload.value["path"])
+        name = source.parent.name
     elif video_pick.value:
         source = CLIPS / video_pick.value
         name = slug(source.stem)
@@ -184,8 +177,23 @@ def _(mo, video_pick, video_upload):
 @app.cell
 def _(mo, name, source):
     # The video read once: its cuts, and the small pictures the strip shows.
-    with mo.status.spinner(title="Looking for the cuts"):
-        _scan = scan_video(source, WORK / name, Scan())
+    with mo.status.progress_bar(
+        total=100,
+        title="Reading the video",
+        subtitle="looking for the cuts",
+        show_rate=False,
+        show_eta=False,
+        remove_on_exit=True,
+    ) as _bar:
+        _shown = [0]
+
+        def _report(share, what):
+            _percent = int(share * 100)
+            if _percent > _shown[0]:
+                _bar.update(increment=_percent - _shown[0], subtitle=what)
+                _shown[0] = _percent
+
+        _scan = scan_video(source, WORK / name, Scan(), _report)
     picker = mo.ui.anywidget(ShotPicker(**_scan))
     mo.vstack(
         [
@@ -622,6 +630,10 @@ class Scan:
     default: float = 3.0  # length of the first selection
     shortest: float = 0.5  # the selection cannot be shorter
     longest: float = 20.0  # or longer
+    kinds: tuple = (".mp4", ".mov", ".mkv", ".webm")  # videos that can be uploaded
+    upload: int = 500_000_000  # bytes, the longest upload
+    piece: int = 2_000_000  # bytes sent at a time, so the bar can move
+    reading: float = 0.85  # share of the bar for finding the cuts; the rest is the strip
 
 
 @app.function
@@ -647,10 +659,188 @@ def default_shot(cuts, duration, scan):
 
 
 @app.function
-def scan_video(source, folder, scan):
+def upload_path(folder, filename, size):
+    """Where an uploaded video is kept: <folder>/<name>/source.<ext>. A
+    different video with the same file name gets a folder of its own, so its
+    shots never mix with the other's."""
+    path = Path(filename)
+    name = slug(path.stem)
+    target = folder / name / f"source{path.suffix.lower()}"
+    if target.exists() and target.stat().st_size != size:
+        target = folder / f"{name}_{size}" / target.name
+    return target
+
+
+@app.class_definition
+class VideoDrop(anywidget.AnyWidget):
+    """A place to drop a video, with a bar. The file travels in small pieces
+    straight to disk, so the page can say how far it has got and a long video
+    is never held in memory. `path` changes when the whole file has arrived."""
+
+    _css = r"""
+    .vd {
+      display: block; box-sizing: border-box; width: 100%; padding: 18px 16px;
+      border: 1.5px dashed #383b3e; border-radius: 4px; color: #383b3e;
+      cursor: pointer; text-align: center; outline: none; background: transparent;
+    }
+    .vd:hover, .vd:focus-visible, .vd.vd-over { background: rgba(242, 217, 78, .28); }
+    .vd.vd-busy { cursor: progress; border-style: solid; }
+    .vd-main { font-size: 16px; }
+    .vd-sub { font: 12px 'IBM Plex Mono', ui-monospace, monospace; margin-top: 4px; opacity: .75; }
+    .vd-bar { display: none; height: 6px; margin-top: 10px; background: rgba(56, 59, 62, .18); }
+    .vd-bar i { display: block; height: 100%; width: 0; background: #383b3e; transition: width .15s; }
+    .vd-busy .vd-bar { display: block; }
+    .vd-error .vd-sub { opacity: 1; background: #f2d94e; display: inline-block; padding: 1px 6px; }
+    """
+
+    _esm = r"""
+    const mb = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0);
+
+    function render({ model, el }) {
+      const kinds = model.get("kinds"), limit = model.get("limit"), piece = model.get("piece");
+      el.innerHTML = `<div class="vd" role="button" tabindex="0">
+        <input type="file" accept="${kinds.join(",")}" hidden>
+        <div class="vd-main"></div><div class="vd-sub"></div><div class="vd-bar"><i></i></div>
+      </div>`;
+      const box = el.querySelector(".vd"), input = el.querySelector("input");
+      const main = el.querySelector(".vd-main"), sub = el.querySelector(".vd-sub");
+      const bar = el.querySelector(".vd-bar i");
+      let file = null, started = 0;
+
+      function idle(title, note, error) {
+        file = null;
+        box.className = error ? "vd vd-error" : "vd";
+        main.textContent = title; sub.textContent = note;
+      }
+      const hint = `${kinds.map((k) => k.slice(1)).join(", ")}, up to ${mb(limit)} MB`;
+      const empty = () => idle("Drop a video here, or click to choose one", hint);
+      const shown = model.get("shown");
+      if (shown) idle(`${shown} is here`, "Drop another video to replace it"); else empty();
+
+      function begin(f) {
+        if (file || !f) return;
+        const dot = f.name.lastIndexOf(".");
+        if (!kinds.includes(f.name.slice(dot).toLowerCase())) return idle(f.name, `not a video this page can read (${hint})`, true);
+        if (f.size > limit) return idle(f.name, `${mb(f.size)} MB is too long: the limit is ${mb(limit)} MB`, true);
+        file = f; started = performance.now();
+        box.className = "vd vd-busy"; bar.style.width = "0";
+        main.textContent = `Uploading ${f.name}`; sub.textContent = `0 of ${mb(f.size)} MB`;
+        model.send({ kind: "start", name: f.name, size: f.size });
+      }
+      async function next(at) {
+        const share = at / file.size, secs = (performance.now() - started) / 1000;
+        bar.style.width = `${share * 100}%`;
+        const left = share > 0.03 ? Math.ceil((secs * (1 - share)) / share) : null;
+        sub.textContent = `${mb(at)} of ${mb(file.size)} MB` + (left === null ? "" : ` · about ${left} s left`);
+        if (at >= file.size) { main.textContent = `Saving ${file.name}`; model.send({ kind: "end" }); return; }
+        const sent = file;
+        const buffer = await file.slice(at, at + piece).arrayBuffer();
+        if (sent === file) model.send({ kind: "piece", at }, undefined, [buffer]);
+      }
+      const onMessage = (msg) => {
+        if (!file) return;
+        if (msg.kind === "next") next(msg.at);
+        else if (msg.kind === "error") idle(file.name, msg.text, true);
+        else if (msg.kind === "saved") {
+          const name = file.name;
+          idle(`${name} is here`, "Drop another video to replace it");
+          model.set("shown", name); model.set("path", msg.path); model.save_changes();
+        }
+      };
+      model.on("msg:custom", onMessage);
+
+      box.addEventListener("click", () => { if (!file) input.click(); });
+      box.addEventListener("keydown", (e) => {
+        if ((e.key === "Enter" || e.key === " ") && !file) { e.preventDefault(); input.click(); }
+      });
+      input.addEventListener("change", () => { begin(input.files[0]); input.value = ""; });
+      for (const type of ["dragenter", "dragover"]) {
+        box.addEventListener(type, (e) => { e.preventDefault(); if (!file) box.classList.add("vd-over"); });
+      }
+      box.addEventListener("dragleave", () => box.classList.remove("vd-over"));
+      box.addEventListener("drop", (e) => {
+        e.preventDefault(); box.classList.remove("vd-over"); begin(e.dataTransfer.files[0]);
+      });
+      return () => model.off("msg:custom", onMessage);
+    }
+    export default { render };
+    """
+    kinds = traitlets.List([]).tag(sync=True)
+    limit = traitlets.Int(0).tag(sync=True)
+    piece = traitlets.Int(0).tag(sync=True)
+    path = traitlets.Unicode("").tag(sync=True)
+    shown = traitlets.Unicode("").tag(sync=True)
+
+    def __init__(self, folder, scan):
+        super().__init__(kinds=list(scan.kinds), limit=scan.upload, piece=scan.piece)
+        self._folder, self._target, self._part, self._size, self._at = folder, None, None, 0, 0
+        self.on_msg(self._on_piece)
+
+    def _on_piece(self, _widget, msg, buffers):
+        """One message of an upload: start, a piece of the file, or the end."""
+        try:
+            if msg["kind"] == "start":
+                self._begin(msg["name"], int(msg["size"]))
+            elif msg["kind"] == "piece":
+                self._write(int(msg["at"]), bytes(buffers[0]))
+            elif msg["kind"] == "end":
+                self._finish()
+        except (OSError, ValueError) as e:
+            self.send({"kind": "error", "text": str(e)})
+
+    def _begin(self, filename, size):
+        if Path(filename).suffix.lower() not in self.kinds or not 0 < size <= self.limit:
+            raise ValueError("this file cannot be uploaded here")
+        self._target = upload_path(self._folder, filename, size)
+        self._target.parent.mkdir(parents=True, exist_ok=True)
+        self._part = self._target.with_suffix(self._target.suffix + ".part")
+        self._part.write_bytes(b"")
+        self._size, self._at = size, 0
+        self.send({"kind": "next", "at": 0})
+
+    def _write(self, at, data):
+        if self._part is None or at != self._at:
+            raise ValueError("a piece of the file arrived out of order: try again")
+        with self._part.open("ab") as f:
+            f.write(data)
+        self._at += len(data)
+        self.send({"kind": "next", "at": self._at})
+
+    def _finish(self):
+        if self._part is None or self._at != self._size:
+            raise ValueError("the file arrived incomplete: try again")
+        self._part.replace(self._target)
+        self._part = None
+        self.send({"kind": "saved", "path": str(self._target)})
+
+
+@app.function
+def find_cuts(source, duration, scan, report):
+    """The times where the picture changes at once. ffmpeg prints a score for
+    every frame, so `report(share of the video read)` can follow it."""
+    find = (
+        f"scale={scan.width}:-2,select='gte(scene,0)',metadata=print:key=lavfi.scene_score:file=-"
+    )
+    cmd = [ffmpeg(), "-v", "error", "-i", str(source), "-an", "-vf", find, "-f", "null", "-"]
+    times, now = [], 0.0
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as p:
+        for raw in p.stdout:
+            line = raw.decode("ascii", "replace").strip()
+            if line.startswith("frame:"):
+                now = float(line.rsplit("pts_time:", 1)[1])
+                report(min(now / duration, 1.0))
+            elif line.startswith("lavfi.scene_score=") and float(line.split("=")[1]) > scan.cut:
+                times.append(now)
+    if p.returncode:
+        raise RuntimeError(f"ffmpeg could not read {source.name}")
+    return clean_cuts(times, duration, scan.min_shot)
+
+
+@app.function
+def scan_video(source, folder, scan, report=lambda share, what: None):
     """What the shot picker needs: the video's cuts and a JPEG sheet of small
     pictures. Kept in `folder`, under the size and date of the video, so a
-    video is read once."""
+    video is read once. `report(share, what)` follows the work."""
     info = source.stat()
     stem = folder / f"scan_{info.st_size}_{int(info.st_mtime)}"
     meta_file, sheet_file = stem.with_suffix(".json"), stem.with_suffix(".jpg")
@@ -658,13 +848,10 @@ def scan_video(source, folder, scan):
         saved = json.loads(meta_file.read_text())
         return dict(saved, sprite=sheet_file.read_bytes())
     duration = video_duration(source)
-    find = f"scale={scan.width}:-2,select='gt(scene,{scan.cut})',showinfo"
-    cmd = [ffmpeg(), "-hide_banner", "-nostats", "-i", str(source), "-an", "-vf", find]
-    report = subprocess.run(
-        [*cmd, "-f", "null", "-"], capture_output=True, check=True
-    ).stderr.decode("utf-8", "replace")
-    times = [float(t) for t in re.findall(r"pts_time:([\d.]+)", report)]
-    cuts = clean_cuts(times, duration, scan.min_shot)
+    cuts = find_cuts(
+        source, duration, scan, lambda d: report(d * scan.reading, "looking for the cuts")
+    )
+    report(scan.reading, "making the strip")
     rate = min(scan.rate, scan.thumbs / duration)
     count = max(1, int(duration * rate))
     rows = math.ceil(count / scan.cols)
