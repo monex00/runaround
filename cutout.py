@@ -30,12 +30,14 @@ with app.setup:
     # and tools/masks.py imports them; the layout comes from runaround.py.
     import base64
     import io
+    import itertools
     import json
+    import math
     import os
     import re
     import shutil
     import subprocess
-    from dataclasses import asdict, replace
+    from dataclasses import asdict, dataclass, replace
     from pathlib import Path
 
     import anywidget
@@ -180,36 +182,29 @@ def _(mo, video_pick, video_upload):
 
 
 @app.cell
-def _(duration, mo):
-    start = mo.ui.number(0.0, round(duration, 1), step=0.1, value=0.0, label="start (s)")
-    length = mo.ui.number(
-        0.5, 20.0, step=0.5, value=max(0.5, min(3.0, duration // 0.5 * 0.5)), label="length (s)"
-    )
-    mo.hstack([start, length, mo.md(f"<small>of {duration:.1f} s</small>")], justify="start")
-    return length, start
-
-
-@app.cell
-def _(duration, length, mo, name, source, start, fps, width):
-    # Each shot gets its own folder, so nothing made before is overwritten.
-    shot = (start.value, min(start.value + length.value, duration))
-    work = WORK / name / f"{shot[0]:.1f}-{shot[1]:.1f}s_{fps.value}fps_{width.value}px"
+def _(mo, name, source):
+    # The video read once: its cuts, and the small pictures the strip shows.
+    with mo.status.spinner(title="Looking for the cuts"):
+        _scan = scan_video(source, WORK / name, Scan())
+    picker = mo.ui.anywidget(ShotPicker(**_scan))
     mo.vstack(
         [
             mo.md(
-                "The first and the last frame of the shot. Keep it to one shot: "
-                "SAM 2 cannot follow a figure across a cut."
+                "**Pick the shot.** The strip is the whole video, divided at its cuts. Click "
+                "a shot, then trim it. Stay inside one: SAM 2 cannot follow a figure across "
+                "a cut."
             ),
-            mo.hstack(
-                # the last frame starts one frame before the end: at the end there is none
-                [
-                    frame_at(source, t, width.value // 3)
-                    for t in (shot[0], max(shot[0], shot[1] - 1 / fps.value))
-                ],
-                justify="start",
-            ),
+            picker,
         ]
     )
+    return (picker,)
+
+
+@app.cell
+def _(duration, fps, name, picker, width):
+    # Each shot gets its own folder, so nothing made before is overwritten.
+    shot = (round(picker.value["start"], 1), round(min(picker.value["end"], duration), 1))
+    work = WORK / name / f"{shot[0]:.1f}-{shot[1]:.1f}s_{fps.value}fps_{width.value}px"
     return shot, work
 
 
@@ -422,14 +417,6 @@ def video_duration(path):
 
 
 @app.function
-def frame_at(path, t, width):
-    """One frame of a video at t seconds, `width` px wide."""
-    cmd = [ffmpeg(), "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1"]
-    cmd += ["-vf", f"scale={width}:-2", "-f", "image2pipe", "-c:v", "png", "-"]
-    return Image.open(io.BytesIO(subprocess.run(cmd, capture_output=True, check=True).stdout))
-
-
-@app.function
 def take_frames(source, work, start, end, fps, width):
     """The shot as PNG frames in work/frames/ (at `fps`, at most `width` px
     wide) and as work/clip.mp4, made from those very PNGs, for SAM 2."""
@@ -616,6 +603,363 @@ def on_paper(rgba, width):
     h = round(rgba.height * width / rgba.width)
     bg = Image.new("RGBA", rgba.size, PAPER["bg"])
     return Image.alpha_composite(bg, rgba).convert("RGB").resize((width, h), Image.LANCZOS)
+
+
+@app.class_definition
+@dataclass(frozen=True)
+class Scan:
+    """How a video is read for the shot picker: its cuts and a sheet of small
+    pictures the browser scrubs through. Times in seconds."""
+
+    cut: float = 0.3  # how much a frame must differ from the last to be a cut (0..1)
+    width: int = 160  # px, the frames compared to find the cuts
+    min_shot: float = 0.25  # cuts closer than this are one cut (a flash)
+    thumb: int = 320  # px, the pictures of the strip
+    rate: float = 4.0  # pictures a second, at most
+    thumbs: int = 900  # pictures in all, at most
+    cols: int = 30  # pictures per row of the sheet
+    quality: int = 6  # JPEG quality of the sheet (ffmpeg: 2 best, 31 worst)
+    default: float = 3.0  # length of the first selection
+    shortest: float = 0.5  # the selection cannot be shorter
+    longest: float = 20.0  # or longer
+
+
+@app.function
+def clean_cuts(times, duration, gap):
+    """The cut times in order, without those at the very ends of the video
+    and with cuts closer than `gap` counted once."""
+    out = []
+    for t in sorted(times):
+        if gap <= t <= duration - gap and (not out or t - out[-1] >= gap):
+            out.append(t)
+    return out
+
+
+@app.function
+def default_shot(cuts, duration, scan):
+    """The first selection: the start of the longest shot, on tenths of a
+    second, never past its cut."""
+    bounds = [0.0, *cuts, duration]
+    s, e = max(itertools.pairwise(bounds), key=lambda p: p[1] - p[0])
+    first = math.ceil(round(s * 10, 6)) / 10
+    last = math.floor(round(e * 10, 6)) / 10
+    return first, round(min(last, first + scan.default), 1)
+
+
+@app.function
+def scan_video(source, folder, scan):
+    """What the shot picker needs: the video's cuts and a JPEG sheet of small
+    pictures. Kept in `folder`, under the size and date of the video, so a
+    video is read once."""
+    info = source.stat()
+    stem = folder / f"scan_{info.st_size}_{int(info.st_mtime)}"
+    meta_file, sheet_file = stem.with_suffix(".json"), stem.with_suffix(".jpg")
+    if meta_file.exists() and sheet_file.exists():
+        saved = json.loads(meta_file.read_text())
+        return dict(saved, sprite=sheet_file.read_bytes())
+    duration = video_duration(source)
+    find = f"scale={scan.width}:-2,select='gt(scene,{scan.cut})',showinfo"
+    cmd = [ffmpeg(), "-hide_banner", "-nostats", "-i", str(source), "-an", "-vf", find]
+    report = subprocess.run(
+        [*cmd, "-f", "null", "-"], capture_output=True, check=True
+    ).stderr.decode("utf-8", "replace")
+    times = [float(t) for t in re.findall(r"pts_time:([\d.]+)", report)]
+    cuts = clean_cuts(times, duration, scan.min_shot)
+    rate = min(scan.rate, scan.thumbs / duration)
+    count = max(1, int(duration * rate))
+    rows = math.ceil(count / scan.cols)
+    tile = f"fps={rate:.5f},scale={scan.thumb}:-2,tile={scan.cols}x{rows}"
+    cmd = [ffmpeg(), "-v", "error", "-i", str(source), "-an", "-vf", tile, "-frames:v", "1"]
+    cmd += ["-q:v", str(scan.quality), "-f", "image2pipe", "-c:v", "mjpeg", "-"]
+    sprite = subprocess.run(cmd, capture_output=True, check=True).stdout
+    start, end = default_shot(cuts, duration, scan)
+    meta = dict(
+        duration=duration,
+        rate=rate,
+        count=count,
+        cols=scan.cols,
+        rows=rows,
+        shortest=scan.shortest,
+        longest=scan.longest,
+    )
+    saved = dict(meta=meta, cuts=cuts, start=start, end=end)
+    folder.mkdir(parents=True, exist_ok=True)
+    sheet_file.write_bytes(sprite)
+    meta_file.write_text(json.dumps(saved))
+    return dict(saved, sprite=sprite)
+
+
+@app.class_definition
+class ShotPicker(anywidget.AnyWidget):
+    """The video as a strip cut into its shots. Click a shot, then drag the
+    two ends of the selection in the close-up below. `start` and `end` reach
+    Python only when the mouse is released."""
+
+    _css = r"""
+    .sp { color: #383b3e; max-width: 100%; position: relative; }
+    .sp-frames { display: flex; gap: 8px; margin-bottom: 8px; }
+    .sp-frames figure { flex: 0 1 400px; margin: 0; min-width: 0; }
+    .sp-frames canvas { display: block; width: 100%; background: #383b3e; }
+    .sp-frames figcaption, .sp-label, .sp-read {
+      font: 12px 'IBM Plex Mono', ui-monospace, monospace;
+    }
+    .sp-frames figcaption { margin-top: 3px; opacity: .7; }
+    .sp-label { margin: 10px 0 3px; opacity: .7; }
+    .sp-strip { display: block; width: 100%; touch-action: none; outline: none; }
+    .sp-all { height: 44px; cursor: pointer; }
+    .sp-near { height: 76px; cursor: ew-resize; }
+    .sp-near:focus-visible { outline: 2px solid #383b3e; }
+    .sp-read { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
+    .sp-read b { font-weight: 600; }
+    .sp-read button {
+      font: inherit; color: inherit; background: transparent; cursor: pointer;
+      border: 1px solid #383b3e; border-radius: 3px; padding: 2px 10px;
+    }
+    .sp-warn { background: #f2d94e; padding: 1px 6px; }
+    .sp-tip {
+      position: absolute; display: none; pointer-events: none; z-index: 5;
+      background: #383b3e; color: #f4f0e8; padding: 3px;
+      font: 11px 'IBM Plex Mono', ui-monospace, monospace; text-align: center;
+    }
+    .sp-tip canvas { display: block; width: 160px; }
+    """
+
+    _esm = r"""
+    const INK = "#383b3e", MARK = "#f2d94e";
+    const up10 = (t) => Math.ceil(Math.round(t * 1e6) / 1e5) / 10;
+    const down10 = (t) => Math.floor(Math.round(t * 1e6) / 1e5) / 10;
+    const near10 = (t) => Math.round(t * 10) / 10;
+    const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+
+    function render({ model, el }) {
+      const m = model.get("meta"), cuts = model.get("cuts"), dur = m.duration;
+      const bounds = [0, ...cuts, dur];
+      let a = model.get("start"), b = model.get("end");
+      let view = [0, dur], hover = -1, drag = null, side = "b", playing = 0, playT = null, saveTimer = 0;
+
+      el.innerHTML = `<div class="sp">
+        <div class="sp-frames">
+          <figure><canvas data-f="a"></canvas><figcaption>first frame</figcaption></figure>
+          <figure><canvas data-f="b"></canvas><figcaption>last frame</figcaption></figure>
+        </div>
+        <div class="sp-read"><button type="button">play</button><span class="sp-time"></span><span class="sp-note"></span></div>
+        <div class="sp-label">the whole video: click a shot</div>
+        <canvas class="sp-strip sp-all"></canvas>
+        <div class="sp-label">this shot: drag the two ends, or the middle to move them together (arrow keys: a tenth of a second)</div>
+        <canvas class="sp-strip sp-near" tabindex="0"></canvas>
+        <div class="sp-tip"><canvas></canvas><span></span></div>
+      </div>`;
+      const root = el.querySelector(".sp");
+      const [fa, fb] = el.querySelectorAll(".sp-frames canvas");
+      const all = el.querySelector(".sp-all"), near = el.querySelector(".sp-near");
+      const time = el.querySelector(".sp-time"), note = el.querySelector(".sp-note");
+      const play = el.querySelector("button"), tip = el.querySelector(".sp-tip");
+      const tipPic = tip.querySelector("canvas"), tipTime = tip.querySelector("span");
+
+      const raw = model.get("sprite");
+      const bytes = raw.buffer ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength) : raw;
+      const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+      const sheet = new Image();
+      let tw = 0, th = 0;
+
+      const shotAt = (t) => {
+        for (let i = 0; i < bounds.length - 1; i++) if (t < bounds[i + 1]) return i;
+        return bounds.length - 2;
+      };
+      let cur = shotAt((a + b) / 2);
+
+      function pic(x, t, dx, dy, w, h) {
+        if (!tw) return;
+        const i = clamp(Math.round(t * m.rate), 0, m.count - 1);
+        x.drawImage(sheet, (i % m.cols) * tw, Math.floor(i / m.cols) * th, tw, th, dx, dy, w, h);
+      }
+      function fit(c) {
+        const w = c.clientWidth || 800, h = c.clientHeight, r = window.devicePixelRatio || 1;
+        if (c.width !== Math.round(w * r) || c.height !== Math.round(h * r)) {
+          c.width = Math.round(w * r); c.height = Math.round(h * r);
+        }
+        const x = c.getContext("2d");
+        x.setTransform(r, 0, 0, r, 0, 0);
+        return [x, w, h];
+      }
+      function film(x, w, h, t0, t1) {
+        const step = Math.max(8, h * (tw / (th || 1)));
+        x.fillStyle = INK; x.fillRect(0, 0, w, h);
+        for (let p = 0; p < w; p += step) pic(x, t0 + ((p + step / 2) / w) * (t1 - t0), p, 0, step, h);
+      }
+      function setView() {
+        const s = bounds[cur], e = bounds[cur + 1], pad = Math.max(1, (e - s) * 0.15);
+        let f = Math.min(s, a) - pad, t = Math.max(e, b) + pad;
+        if (t - f > 60) { const mid = (a + b) / 2; f = mid - 30; t = mid + 30; }
+        view = [Math.max(0, f), Math.min(dur, t)];
+      }
+      const crossing = () => cuts.filter((c) => c > a + 0.05 && c < b - 0.05).length;
+
+      function drawFrames() {
+        for (const [c, t] of [[fa, playT ?? a], [fb, Math.max(a, b - 1 / m.rate)]]) {
+          if (!tw) continue;
+          const w = c.clientWidth || 400, h = w * (th / tw), r = window.devicePixelRatio || 1;
+          c.style.height = h + "px";
+          if (c.width !== Math.round(w * r)) { c.width = Math.round(w * r); c.height = Math.round(h * r); }
+          const x = c.getContext("2d");
+          x.setTransform(r, 0, 0, r, 0, 0);
+          x.imageSmoothingQuality = "high";
+          pic(x, t, 0, 0, w, h);
+        }
+      }
+      function drawAll() {
+        const [x, w, h] = fit(all), X = (t) => (t / dur) * w;
+        film(x, w, h, 0, dur);
+        x.fillStyle = "rgba(244,240,232,.62)";
+        for (let i = 0; i < bounds.length - 1; i++) {
+          if (i === cur || i === hover) continue;
+          x.fillRect(X(bounds[i]), 0, X(bounds[i + 1]) - X(bounds[i]), h);
+        }
+        x.fillStyle = "#fff";
+        for (const c of cuts) x.fillRect(X(c) - 0.5, 0, 1, h);
+        x.strokeStyle = MARK; x.lineWidth = 3;
+        x.strokeRect(X(a) + 1, 1.5, Math.max(3, X(b) - X(a) - 2), h - 3);
+      }
+      function drawNear() {
+        const [x, w, h] = fit(near), [f, t] = view, X = (v) => ((v - f) / (t - f)) * w;
+        film(x, w, h, f, t);
+        x.fillStyle = "rgba(244,240,232,.72)";
+        x.fillRect(0, 0, X(a), h); x.fillRect(X(b), 0, w - X(b), h);
+        x.fillStyle = "#fff";
+        for (const c of cuts) if (c > f && c < t) x.fillRect(X(c) - 1, 0, 2, h);
+        x.fillStyle = MARK;
+        x.fillRect(X(a), 0, X(b) - X(a), 3); x.fillRect(X(a), h - 3, X(b) - X(a), 3);
+        for (const v of [a, b]) {
+          const p = X(v) + (v === a ? 0 : -9);
+          x.fillStyle = MARK; x.fillRect(p, 0, 9, h);
+          x.fillStyle = INK; x.fillRect(p + 3, h / 2 - 10, 1, 20); x.fillRect(p + 5, h / 2 - 10, 1, 20);
+        }
+        if (playT !== null) { x.fillStyle = "#fff"; x.fillRect(X(playT) - 1, 0, 2, h); }
+      }
+      function drawText() {
+        time.innerHTML = `<b>${a.toFixed(1)} s → ${b.toFixed(1)} s</b> · ${(b - a).toFixed(1)} s · shot ${cur + 1} of ${bounds.length - 1}`;
+        const n = crossing();
+        note.className = n ? "sp-note sp-warn" : "sp-note";
+        note.textContent = n ? (n === 1 ? "crosses a cut: SAM 2 will lose the figure" : `crosses ${n} cuts: SAM 2 will lose the figure`) : "";
+      }
+      function draw() { drawFrames(); drawAll(); drawNear(); drawText(); }
+
+      const commit = () => { model.set("start", a); model.set("end", b); model.save_changes(); };
+      function stop() {
+        if (playing) cancelAnimationFrame(playing);
+        playing = 0; playT = null; play.textContent = "play";
+      }
+      function pick(i) {
+        stop();
+        cur = i;
+        let s = up10(bounds[i]), e = down10(bounds[i + 1]);
+        if (e - s > m.longest) e = near10(s + m.longest);
+        if (e - s < m.shortest) { e = near10(Math.min(dur, s + m.shortest)); s = near10(Math.max(0, e - m.shortest)); }
+        a = s; b = e; setView(); draw(); commit();
+      }
+      function snap(t, which, perSec) {
+        const reach = 6 / perSec;
+        for (const c of cuts) if (Math.abs(c - t) <= reach) return which === "a" ? up10(c) : down10(c);
+        return near10(t);
+      }
+      function setA(t) { a = near10(clamp(t, Math.max(0, b - m.longest), b - m.shortest)); }
+      function setB(t) { b = near10(clamp(t, a + m.shortest, Math.min(down10(dur), a + m.longest))); }
+
+      function showTip(e, c, t) {
+        const r = c.getBoundingClientRect(), o = root.getBoundingClientRect();
+        if (tw) {
+          const i = clamp(Math.round(t * m.rate), 0, m.count - 1);
+          tipPic.width = 320; tipPic.height = Math.round(320 * th / tw);
+          tipPic.getContext("2d").drawImage(sheet, (i % m.cols) * tw, Math.floor(i / m.cols) * th, tw, th, 0, 0, tipPic.width, tipPic.height);
+        }
+        tipTime.textContent = `${t.toFixed(1)} s`;
+        tip.style.display = "block";
+        tip.style.left = clamp(e.clientX - o.left - 83, 0, o.width - 166) + "px";
+        tip.style.top = r.top - o.top - tip.offsetHeight - 4 + "px";
+      }
+      const hideTip = () => { tip.style.display = "none"; };
+
+      all.addEventListener("pointermove", (e) => {
+        const r = all.getBoundingClientRect(), t = clamp(((e.clientX - r.left) / r.width) * dur, 0, dur);
+        const i = shotAt(t);
+        if (i !== hover) { hover = i; drawAll(); }
+        showTip(e, all, t);
+      });
+      all.addEventListener("pointerleave", () => { hover = -1; drawAll(); hideTip(); });
+      all.addEventListener("click", (e) => {
+        const r = all.getBoundingClientRect();
+        pick(shotAt(clamp(((e.clientX - r.left) / r.width) * dur, 0, dur)));
+      });
+
+      const nearT = (e) => {
+        const r = near.getBoundingClientRect();
+        return view[0] + clamp((e.clientX - r.left) / r.width, 0, 1) * (view[1] - view[0]);
+      };
+      near.addEventListener("pointerdown", (e) => {
+        stop(); hideTip(); near.focus({ preventScroll: true }); near.setPointerCapture(e.pointerId);
+        const r = near.getBoundingClientRect(), perSec = r.width / (view[1] - view[0]);
+        const t = nearT(e), da = Math.abs(t - a) * perSec, db = Math.abs(t - b) * perSec;
+        if (Math.min(da, db) <= 12) drag = da <= db ? "a" : "b";
+        else if (t > a && t < b) drag = { off: t - a, len: b - a };
+        else drag = t < a ? "a" : "b";
+        if (typeof drag === "string") { side = drag; move(e); }
+      });
+      function move(e) {
+        const r = near.getBoundingClientRect(), perSec = r.width / (view[1] - view[0]), t = nearT(e);
+        if (drag === "a") setA(snap(t, "a", perSec));
+        else if (drag === "b") setB(snap(t, "b", perSec));
+        else { a = near10(clamp(t - drag.off, 0, down10(dur) - drag.len)); b = near10(a + drag.len); }
+        cur = shotAt((a + b) / 2);
+        drawFrames(); drawAll(); drawNear(); drawText();
+      }
+      near.addEventListener("pointermove", (e) => {
+        if (drag) { move(e); return; }
+        const perSec = near.getBoundingClientRect().width / (view[1] - view[0]), t = nearT(e);
+        near.style.cursor = Math.min(Math.abs(t - a), Math.abs(t - b)) * perSec <= 12 ? "ew-resize" : t > a && t < b ? "grab" : "pointer";
+        showTip(e, near, t);
+      });
+      near.addEventListener("pointerleave", hideTip);
+      const release = () => { if (drag) { drag = null; setView(); draw(); commit(); } };
+      near.addEventListener("pointerup", release);
+      near.addEventListener("pointercancel", release);
+      near.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+        e.preventDefault(); stop();
+        const d = (e.key === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 1 : 0.1);
+        if (side === "a") setA(a + d); else setB(b + d);
+        cur = shotAt((a + b) / 2); draw();
+        clearTimeout(saveTimer); saveTimer = setTimeout(commit, 350);
+      });
+
+      play.addEventListener("click", () => {
+        if (playing) { stop(); draw(); return; }
+        play.textContent = "stop";
+        const t0 = performance.now();
+        const tick = (now) => {
+          playT = a + (((now - t0) / 1000) % (b - a));
+          drawFrames(); drawNear();
+          playing = requestAnimationFrame(tick);
+        };
+        playing = requestAnimationFrame(tick);
+      });
+
+      sheet.onload = () => {
+        tw = sheet.naturalWidth / m.cols; th = sheet.naturalHeight / m.rows;
+        setView(); draw();
+      };
+      sheet.src = url;
+      const seen = new ResizeObserver(() => { if (tw) draw(); });
+      seen.observe(root);
+      drawText();
+      return () => { stop(); clearTimeout(saveTimer); seen.disconnect(); URL.revokeObjectURL(url); };
+    }
+    export default { render };
+    """
+    sprite = traitlets.Bytes(b"").tag(sync=True)
+    meta = traitlets.Dict({}).tag(sync=True)
+    cuts = traitlets.List([]).tag(sync=True)
+    start = traitlets.Float(0.0).tag(sync=True)
+    end = traitlets.Float(0.0).tag(sync=True)
 
 
 @app.class_definition

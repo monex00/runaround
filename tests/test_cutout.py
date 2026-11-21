@@ -155,3 +155,16 @@ def test_cutout_notebook_export_is_a_playground_upload():
     for (_, mask), f in zip(back, frames):
         assert np.array_equal(mask >= 0.5, np.asarray(f.getchannel("A")) >= 128)
     assert slug("Spring (2019) final.MKV") == "spring_2019_final_mkv"
+
+
+def test_shot_picker_cuts_and_first_selection():
+    """Cuts at the ends or a flash apart count once, and the first selection
+    sits inside the longest shot, on tenths of a second."""
+    pytest.importorskip("anywidget")
+    from cutout import Scan, clean_cuts, default_shot
+
+    assert clean_cuts([0.1, 5.0, 5.1, 9.0, 9.95], 10.0, 0.25) == [5.0, 9.0]
+    scan = Scan(default=3.0)
+    assert default_shot([2.0, 7.25], 10.0, scan) == (2.0, 5.0)
+    assert default_shot([4.03], 5.0, scan) == (0.0, 3.0)
+    assert default_shot([1.0, 2.84], 3.0, scan) == (1.0, 2.8)
