@@ -198,3 +198,63 @@ def test_video_arrives_in_pieces(tmp_path):
     assert first.read_bytes() == b"abcdef"
     drop._on_piece(drop, {"kind": "start", "name": "notes.txt", "size": 2}, [])
     assert sent[-1]["kind"] == "error"
+
+
+def test_boxes_on_any_frame_are_followed_both_ways(tmp_path, monkeypatch):
+    """A box on frame 2 of 5 is followed to the end and back to the start, and
+    its masks land on the right frames, joined with those of a first-frame box."""
+    pytest.importorskip("anywidget")
+    import cutout as C
+
+    prompts = C.as_prompts([[1, 2, 3, 4], {"frame": 2, "box": [5, 6, 7, 8]}])
+    assert prompts[0] == {"frame": 0, "box": [1, 2, 3, 4]}
+    assert C.prompt_groups(prompts) == {0: [[1, 2, 3, 4]], 2: [[5, 6, 7, 8]]}
+    assert C.tracking_steps(5, prompts) == 5 + 6
+
+    runs = {"on0": 5, "on2": 3, "back2": 3}
+    monkeypatch.setattr(
+        C,
+        "clip_from",
+        lambda frames, k, fps, work, backward=False: f"{'back' if backward else 'on'}{k}",
+    )
+
+    def fake(video, boxes):
+        for i in range(runs[video]):
+            m = np.zeros((1, 8), np.float32)
+            # first-frame box lights column 0; the other marks its distance from frame 2
+            m[0, 0 if video == "on0" else 1 + i + (3 if video == "back2" else 0)] = 1
+            yield m
+
+    monkeypatch.setattr(C, "sam2_masks", fake)
+    ticks = []
+    out = C.follow_boxes(list(range(5)), prompts, 12, tmp_path, lambda: ticks.append(1))
+    assert len(out) == 5 and len(ticks) == 11
+    assert all(m[0, 0] == 1 for m in out)
+    assert out[2][0, 1] == 1 and out[3][0, 2] == 1 and out[4][0, 3] == 1  # forward
+    assert out[2][0, 4] == 1 and out[1][0, 5] == 1 and out[0][0, 6] == 1  # backward
+
+
+def test_clip_backward_begins_on_the_frame_of_the_box(tmp_path):
+    """SAM 2 takes the box on the first frame of its video, so the video going
+    backward must begin on that very frame and end on the first of the shot."""
+    pytest.importorskip("anywidget")
+    pytest.importorskip("imageio_ffmpeg")
+    import subprocess
+
+    from PIL import Image
+
+    import cutout as C
+
+    folder = tmp_path / "frames"
+    folder.mkdir()
+    levels = [20, 60, 100, 140, 180, 220]  # each frame has its own grey
+    frames = []
+    for i, v in enumerate(levels):
+        frames.append(folder / f"{i:05d}.png")
+        Image.new("RGB", (64, 64), (v, v, v)).save(frames[-1])
+    video = C.clip_from(frames, 3, 12, tmp_path, backward=True)
+    cmd = [C.ffmpeg(), "-v", "error", "-i", str(video), "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    raw = np.frombuffer(subprocess.run(cmd, capture_output=True, check=True).stdout, np.uint8)
+    seen = raw.reshape(-1, 64, 64).mean(axis=(1, 2))
+    assert len(seen) == 4
+    assert np.abs(seen - np.array([140, 100, 60, 20])).max() < 8

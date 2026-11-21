@@ -28,7 +28,6 @@ with app.setup:
     # per frame out, in masks/cutout/<name>/<shot>/, laid out as masks/<piece>/.
     # The models and the cleaning of their masks live here, below the cells,
     # and tools/masks.py imports them; the layout comes from runaround.py.
-    import base64
     import io
     import itertools
     import json
@@ -249,24 +248,29 @@ def _(mo):
     ## The boxes
 
     SAM 2 needs to be told what to follow: a box around each part of the
-    figure on the first frame. BiRefNet proposes them; drag on the picture
-    to add one, *clear* to start over. A part with no box is not followed.
-    Back on a shot already cut out, the boxes are the ones you used.
+    figure. BiRefNet proposes them on the first frame. If someone comes in
+    later, move along the shot to a frame where they are in view and drag a
+    box around them: SAM 2 follows every box forward and backward from its
+    frame. A part with no box is not followed. Back on a shot already cut
+    out, the boxes are the ones you used.
     """)
     return
 
 
 @app.cell
-def _(frames, mo, work):
-    # The boxes of the last cut-out of this shot, else BiRefNet's.
+def _(fps, frames, mo, shot, work):
+    # The boxes of the last cut-out of this shot, else BiRefNet's on the first frame.
     _record = work / "masks.json"
     _last = json.loads(_record.read_text()).get("boxes") if _record.exists() else None
     if _last:
-        start_boxes = _last
+        start_boxes = as_prompts(_last)
     else:
         with mo.status.spinner(title="BiRefNet looks for the figure"):
-            start_boxes = sam2_prompts(frames[0], Cutout())
-    boxer = mo.ui.anywidget(BoxDrawer(src=data_url(frames[0]), boxes=start_boxes))
+            try:
+                start_boxes = as_prompts(sam2_prompts(frames[0], Cutout()))
+            except SystemExit:  # nobody on the first frame: the boxes are up to you
+                start_boxes = []
+    boxer = mo.ui.anywidget(BoxDrawer(frames, shot[0], fps.value, start_boxes))
     boxer
     return (boxer,)
 
@@ -282,20 +286,20 @@ def _(mo):
         value="SAM 2: follows the boxes",
         label="model",
     )
-    ink = mo.ui.slider(
-        0.0, 0.6, step=0.05, value=Cutout().ink, label="line art: ink recovered (0 = off)"
+    line_art = mo.ui.checkbox(
+        value=False, label="black outlines on a light background (old cartoons)"
     )
     cut_run = mo.ui.run_button(label="cut out")
-    mo.vstack([method, ink, cut_run])
-    return cut_run, ink, method
+    mo.vstack([method, line_art, cut_run])
+    return cut_run, line_art, method
 
 
 @app.cell
-def _(boxer, cut_run, frames, ink, method, mo, work):
+def _(boxer, cut_run, fps, frames, line_art, method, mo, work):
     # Raw masks from the model(s), cleaned and finished as tools/masks.py does,
     # saved in masks/<name>/: %05d.png the text avoids, rgba/ the cut-out.
-    _boxes = [list(map(int, b)) for b in boxer.value["boxes"]]
-    cut = replace(Cutout(), ink=ink.value)
+    _boxes = as_prompts(boxer.value["boxes"])
+    cut = replace(Cutout(), ink=Scan().line_art if line_art.value else 0.0)
     _wanted = dict(method=method.value, boxes=_boxes, cutout=asdict(cut), frames=len(frames))
     _record = work / "masks.json"
     _have = (
@@ -307,11 +311,20 @@ def _(boxer, cut_run, frames, ink, method, mo, work):
         _idx = list(range(len(frames)))
         _raws = []
         for _m in method.value.split("+"):
-            _title = "SAM 2 follows the figure" if _m == "sam2" else "BiRefNet, frame by frame"
-            _gen = (
-                sam2_masks(work / "clip.mp4", _boxes) if _m == "sam2" else rembg_masks(_m, frames)
-            )
-            _raws.append(list(mo.status.progress_bar(_gen, total=len(frames), title=_title)))
+            if _m == "sam2":
+                with mo.status.progress_bar(
+                    total=tracking_steps(len(frames), _boxes), title="SAM 2 follows the figure"
+                ) as _bar:
+                    _raws.append(follow_boxes(frames, _boxes, fps.value, work, _bar.update))
+            else:
+                _gen = rembg_masks(_m, frames)
+                _raws.append(
+                    list(
+                        mo.status.progress_bar(
+                            _gen, total=len(frames), title="BiRefNet, frame by frame"
+                        )
+                    )
+                )
         _raw = [np.maximum.reduce(ms) for ms in zip(*_raws)]
         with mo.status.spinner(title="Cleaning the masks"):
             _avoid, _draw = finish(frames, _idx, _raw, cut)
@@ -439,12 +452,11 @@ def take_frames(source, work, start, end, fps, width):
 
 
 @app.function
-def data_url(path, width=None):
-    """A picture as a data: URL, for the box drawer."""
-    img = Image.open(path).convert("RGB")
+def frame_jpeg(path):
+    """A frame of the shot as JPEG bytes, for the box drawer."""
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    Image.open(path).convert("RGB").save(buf, format="JPEG", quality=Scan().frame_quality)
+    return buf.getvalue()
 
 
 @app.function
@@ -560,6 +572,72 @@ def sam2_masks(video, boxes):
 
 
 @app.function
+def as_prompts(boxes):
+    """Boxes as {"frame": k, "box": [x0, y0, x1, y1]}. A plain box (BiRefNet's
+    proposals, cut-outs saved before boxes had a frame) is on the first frame."""
+    out = []
+    for b in boxes:
+        frame, box = (b["frame"], b["box"]) if isinstance(b, dict) else (0, b)
+        out.append(dict(frame=int(frame), box=[int(v) for v in box]))
+    return out
+
+
+@app.function
+def prompt_groups(prompts):
+    """{frame: [boxes on it]}, frames in order: SAM 2 starts once from each."""
+    groups = {}
+    for p in sorted(prompts, key=lambda p: p["frame"]):
+        groups.setdefault(p["frame"], []).append(p["box"])
+    return groups
+
+
+@app.function
+def tracking_steps(count, prompts):
+    """How many frames SAM 2 goes through: from each frame with boxes to the
+    end, and back to the start (the frame itself twice)."""
+    return sum(count + (1 if k else 0) for k in prompt_groups(prompts))
+
+
+@app.function
+def clip_from(frames, k, fps, work, backward=False):
+    """A video for SAM 2, which starts from its first frame: the shot from
+    frame k to the end, or from k back to the first frame."""
+    path = work / f"track_{k:05d}_{'back' if backward else 'on'}.mp4"
+    if not backward:
+        segment_from_frames(frames[0].parent, k, len(frames) - k, fps, path)
+        return path
+    cmd = [ffmpeg(), "-v", "error", "-y", "-framerate", str(fps), "-start_number", "0"]
+    # cut before turning it round: the video must begin on frame k
+    cmd += ["-i", str(frames[0].parent / "%05d.png"), "-vf", f"trim=end_frame={k + 1},reverse"]
+    cmd += ["-c:v", "libx264", "-crf", "8", "-pix_fmt", "yuv420p", str(path)]
+    subprocess.run(cmd, check=True)
+    return path
+
+
+@app.function
+def follow_boxes(frames, prompts, fps, work, tick=lambda: None):
+    """One mask per frame from SAM 2, for boxes drawn on any frame: it follows
+    each group of boxes from its frame to the end and back to the start, and
+    the results are joined. Someone who walks in later is simply empty before."""
+    joined = None
+    for k, boxes in prompt_groups(prompts).items():
+        runs = [(1, len(frames) - k, clip_from(frames, k, fps, work))]
+        if k:
+            runs.append((-1, k + 1, clip_from(frames, k, fps, work, backward=True)))
+        for step, length, video in runs:
+            seen = 0
+            for i, mask in enumerate(sam2_masks(video, boxes)):
+                if joined is None:
+                    joined = np.zeros((len(frames), *mask.shape), bool)
+                joined[k + step * i] |= mask >= 0.5
+                seen += 1
+                tick()
+            if seen != length:
+                raise RuntimeError(f"SAM 2 gave {seen} masks for {length} frames")
+    return [m.astype(np.float32) for m in joined]
+
+
+@app.function
 def cleaned(frames, idx, raw, cut):
     """Raw masks of frames `idx` cleaned one by one: ink and glow recovered,
     specks dropped, small holes filled."""
@@ -634,6 +712,8 @@ class Scan:
     upload: int = 500_000_000  # bytes, the longest upload
     piece: int = 2_000_000  # bytes sent at a time, so the bar can move
     reading: float = 0.85  # share of the bar for finding the cuts; the rest is the strip
+    frame_quality: int = 85  # JPEG quality of the frames the boxes are drawn on
+    line_art: float = 0.35  # darkness that counts as an outline, for old cartoons
 
 
 @app.function
@@ -1151,65 +1231,164 @@ class ShotPicker(anywidget.AnyWidget):
 
 @app.class_definition
 class BoxDrawer(anywidget.AnyWidget):
-    """A picture you draw boxes on: drag to add one, "clear" to remove them
-    all. `boxes` are [x0, y0, x1, y1] in the picture's own pixels."""
+    """The frames of the shot, to draw boxes on. Move along the shot, drag on
+    the picture to add a box on that frame. `boxes` are
+    {"frame": k, "box": [x0, y0, x1, y1]} in the picture's own pixels. A frame
+    is sent only when it is looked at."""
+
+    _css = r"""
+    .bx { color: #383b3e; max-width: 100%; }
+    .bx-pic { position: relative; display: inline-block; max-width: 100%; line-height: 0;
+      cursor: crosshair; user-select: none; background: #383b3e; min-height: 80px; min-width: 200px; }
+    .bx-pic img { display: block; max-width: 100%; }
+    .bx-pic canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; touch-action: none; }
+    .bx-bar, .bx-row { display: flex; align-items: center; gap: 8px; margin-top: 6px;
+      font: 12px 'IBM Plex Mono', ui-monospace, monospace; }
+    .bx-row { flex-wrap: wrap; }
+    .bx-track { position: relative; flex: 1; min-width: 80px; padding-bottom: 9px; }
+    .bx-track input { display: block; width: 100%; margin: 0; accent-color: #383b3e; }
+    .bx-marks { position: absolute; left: 0; right: 0; bottom: 0; height: 8px; }
+    .bx-marks button { position: absolute; top: 0; width: 7px; height: 8px; margin-left: -3px;
+      padding: 0; border: 0; background: #f2d94e; outline: 1px solid #383b3e; cursor: pointer; }
+    .bx button.bx-b { font: inherit; color: inherit; background: transparent; cursor: pointer;
+      border: 1px solid #383b3e; border-radius: 3px; padding: 2px 8px; }
+    .bx-time { white-space: nowrap; }
+    .bx-note { flex: 1; min-width: 160px; opacity: .75; }
+    """
 
     _esm = r"""
+    const KEEP = 80;
+
     function render({ model, el }) {
-      const wrap = document.createElement("div");
-      wrap.style.cssText = "position:relative;display:inline-block;cursor:crosshair;user-select:none;max-width:100%";
-      const img = document.createElement("img");
-      img.draggable = false;
-      img.style.cssText = "display:block;max-width:100%";
-      const canvas = document.createElement("canvas");
-      canvas.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none";
-      wrap.append(img, canvas);
-      const clear = document.createElement("button");
-      clear.textContent = "clear";
-      clear.style.cssText = "margin-top:6px;font-family:'IBM Plex Mono',monospace";
-      el.append(wrap, clear);
-      let drag = null;
-      const ctx = canvas.getContext("2d");
+      const count = model.get("count"), first = model.get("start"), fps = model.get("fps");
+      el.innerHTML = `<div class="bx">
+        <div class="bx-pic"><img draggable="false" alt="a frame of the shot"><canvas></canvas></div>
+        <div class="bx-bar">
+          <button type="button" class="bx-b" data-go="-1" title="previous frame">&lsaquo;</button>
+          <div class="bx-track"><input type="range" min="0" max="${count - 1}" step="1" value="0" aria-label="frame of the shot"><div class="bx-marks"></div></div>
+          <button type="button" class="bx-b" data-go="1" title="next frame">&rsaquo;</button>
+          <span class="bx-time"></span>
+        </div>
+        <div class="bx-row"><span class="bx-note"></span>
+          <button type="button" class="bx-b" data-clear="here">clear this frame</button>
+          <button type="button" class="bx-b" data-clear="all">clear all</button>
+        </div>
+      </div>`;
+      const img = el.querySelector("img"), canvas = el.querySelector("canvas"), ctx = canvas.getContext("2d");
+      const range = el.querySelector("input"), marks = el.querySelector(".bx-marks");
+      const time = el.querySelector(".bx-time"), note = el.querySelector(".bx-note");
+      const pictures = new Map();
+      let now = 0, shown = -1, asked = -1, drag = null;
+
+      const boxes = () => model.get("boxes");
       function draw() {
+        if (!img.naturalWidth) return;
         canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.lineWidth = Math.max(2, canvas.width / 300);
         ctx.strokeStyle = "#f2d94e";
-        const all = [...model.get("boxes")];
-        if (drag) all.push([drag.a[0], drag.a[1], drag.b[0], drag.b[1]]);
-        for (const [x0, y0, x1, y1] of all) ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+        const here = boxes().filter((b) => b.frame === shown).map((b) => b.box);
+        if (drag) here.push([drag.a[0], drag.a[1], drag.b[0], drag.b[1]]);
+        for (const [x0, y0, x1, y1] of here) ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
       }
-      function at(e) {
+      function words() {
+        const all = boxes(), onThis = all.filter((b) => b.frame === now).length;
+        const frames = new Set(all.map((b) => b.frame)).size;
+        const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "es"}`;
+        note.textContent = all.length
+          ? `${plural(onThis, "box")} here · ${plural(all.length, "box")} in all, on ${frames} frame${frames === 1 ? "" : "s"}`
+          : "no boxes yet: drag on the picture";
+        time.textContent = `${(first + now / fps).toFixed(2)} s · frame ${now + 1} of ${count}`;
+      }
+      function drawMarks() {
+        marks.replaceChildren();
+        for (const k of [...new Set(boxes().map((b) => b.frame))].sort((a, b) => a - b)) {
+          const m = document.createElement("button");
+          m.type = "button"; m.title = `boxes at ${(first + k / fps).toFixed(2)} s`;
+          m.style.left = `calc(8px + (100% - 16px) * ${count > 1 ? k / (count - 1) : 0})`;
+          m.addEventListener("click", () => go(k));
+          marks.append(m);
+        }
+      }
+      function show(k) {
+        shown = k;
+        img.src = pictures.get(k);
+      }
+      function ask(k) {
+        if (asked >= 0) return;
+        asked = k;
+        model.send({ kind: "frame", k });
+      }
+      function go(k) {
+        now = Math.min(Math.max(k, 0), count - 1);
+        range.value = now;
+        words();
+        if (pictures.has(now)) show(now); else ask(now);
+      }
+      const onMessage = (msg, buffers) => {
+        if (msg.kind !== "frame") return;
+        const raw = buffers[0];
+        const bytes = raw.buffer ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength) : raw;
+        pictures.set(msg.k, URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" })));
+        if (pictures.size > KEEP) {
+          const old = [...pictures.keys()].find((k) => k !== now);
+          URL.revokeObjectURL(pictures.get(old)); pictures.delete(old);
+        }
+        asked = -1;
+        if (pictures.has(now)) { if (shown !== now) show(now); } else ask(now);
+      };
+      model.on("msg:custom", onMessage);
+      img.onload = draw;
+
+      const at = (e) => {
         const r = canvas.getBoundingClientRect();
-        return [(e.clientX - r.left) * img.naturalWidth / r.width,
-                (e.clientY - r.top) * img.naturalHeight / r.height];
-      }
+        return [(e.clientX - r.left) * img.naturalWidth / r.width, (e.clientY - r.top) * img.naturalHeight / r.height];
+      };
       canvas.addEventListener("pointerdown", (e) => {
+        if (shown !== now || !img.naturalWidth) return;
         drag = { a: at(e), b: at(e) };
         canvas.setPointerCapture(e.pointerId);
       });
       canvas.addEventListener("pointermove", (e) => { if (drag) { drag.b = at(e); draw(); } });
+      const put = (list) => { model.set("boxes", list); model.save_changes(); changed(); };
+      function changed() { drawMarks(); words(); draw(); }
       canvas.addEventListener("pointerup", () => {
         if (!drag) return;
         const [ax, ay] = drag.a, [bx, by] = drag.b;
         drag = null;
         if (Math.abs(bx - ax) > 4 && Math.abs(by - ay) > 4) {
           const box = [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)].map(Math.round);
-          model.set("boxes", [...model.get("boxes"), box]);
-          model.save_changes();
-        }
-        draw();
+          put([...boxes(), { frame: now, box }]);
+        } else draw();
       });
-      clear.addEventListener("click", () => { model.set("boxes", []); model.save_changes(); });
-      img.onload = draw;
-      img.src = model.get("src");
-      model.on("change:src", () => { img.src = model.get("src"); });
-      model.on("change:boxes", draw);
+      range.addEventListener("input", () => go(Number(range.value)));
+      el.querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => go(now + Number(b.dataset.go))));
+      el.querySelector('[data-clear="here"]').addEventListener("click", () => put(boxes().filter((b) => b.frame !== now)));
+      el.querySelector('[data-clear="all"]').addEventListener("click", () => put([]));
+      model.on("change:boxes", changed);
+      drawMarks();
+      go(boxes().length ? Math.min(...boxes().map((b) => b.frame)) : 0);
+      return () => {
+        model.off("msg:custom", onMessage); model.off("change:boxes", changed);
+        for (const url of pictures.values()) URL.revokeObjectURL(url);
+      };
     }
     export default { render };
     """
-    src = traitlets.Unicode("").tag(sync=True)
+    count = traitlets.Int(0).tag(sync=True)
+    start = traitlets.Float(0.0).tag(sync=True)
+    fps = traitlets.Float(12.0).tag(sync=True)
     boxes = traitlets.List([]).tag(sync=True)
+
+    def __init__(self, frames, start, fps, boxes):
+        super().__init__(count=len(frames), start=start, fps=fps, boxes=boxes)
+        self._frames = frames
+        self.on_msg(self._on_ask)
+
+    def _on_ask(self, _widget, msg, _buffers):
+        """The page asks for a frame; it travels as a JPEG."""
+        if msg.get("kind") == "frame":
+            k = max(0, min(int(msg["k"]), len(self._frames) - 1))
+            self.send({"kind": "frame", "k": k}, [frame_jpeg(self._frames[k])])
 
 
 if __name__ == "__main__":
