@@ -11,6 +11,8 @@ __marimo__/
 .ruff_cache/
 *.mp4
 !demo/*/loop.mp4
+!demo/examples/*.mp4
+!public/demo/examples/*.mp4
 !public/demo/*/loop.mp4
 *.mov
 *.mkv

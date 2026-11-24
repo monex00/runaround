@@ -258,3 +258,16 @@ def test_clip_backward_begins_on_the_frame_of_the_box(tmp_path):
     seen = raw.reshape(-1, 64, 64).mean(axis=(1, 2))
     assert len(seen) == 4
     assert np.abs(seen - np.array([140, 100, 60, 20])).max() < 8
+
+
+def test_examples_are_there_and_can_be_read():
+    """cutout.py starts on an example: each one ships with the repository and
+    ffmpeg reads a few seconds of video from it."""
+    pytest.importorskip("anywidget")
+    pytest.importorskip("imageio_ffmpeg")
+    import cutout as C
+
+    for example in C.EXAMPLES.values():
+        path = C.example_video(example["file"])
+        assert path.exists()
+        assert 5 < C.video_duration(path) < 30

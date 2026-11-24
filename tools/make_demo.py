@@ -2,6 +2,7 @@
 
     uv run python tools/make_demo.py            # frames, window and loop
     uv run python tools/make_demo.py --loops    # window and loop only
+    uv run python tools/make_demo.py --examples # example videos for cutout.py
 
 Only pieces we may publish: the tango (The Gallopin' Gaucho, 1928, US public
 domain), Spring (Blender Studio, CC-BY 4.0) and our own fox. Each becomes
@@ -60,6 +61,40 @@ PUBLIC = {
 }
 
 
+# Short videos cutout.py starts from, cut from the same public pieces: the
+# piece's own shot, H.264 at most `EXAMPLE_WIDTH` px wide, no sound.
+# One shot each: ffmpeg's cut finder misses the tango's cuts (101.52, 103.02 s),
+# so its example stops before them.
+EXAMPLES = {"spring": None, "tango": 101.4}
+EXAMPLE_WIDTH = 1280
+EXAMPLE_CRF = 23
+
+
+def examples():
+    """demo/examples/<slug>.mp4 for each of EXAMPLES."""
+    pieces = load_pieces()
+    out = DEMO / "examples"
+    out.mkdir(parents=True, exist_ok=True)
+    for slug, stop in EXAMPLES.items():
+        piece = pieces[slug]
+        path = out / f"{slug}.mp4"
+        end = stop or piece["end"]
+        cmd = ["ffmpeg", "-v", "error", "-y", "-ss", str(piece["start"]), "-to", str(end)]
+        cmd += ["-i", str(ROOT / "clips" / piece["clip"]), "-an"]
+        cmd += ["-vf", f"scale='min({EXAMPLE_WIDTH},iw)':-2", "-c:v", "libx264", "-preset", "slow"]
+        cmd += [
+            "-crf",
+            str(EXAMPLE_CRF),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+        subprocess.run(cmd, check=True)
+        print(f"{slug}: {path.stat().st_size / 1e6:.1f} MB, {PUBLIC[slug]}")
+
+
 def loops_only():
     """Only the window and the loop of each demo, from the frames already
     there: after a change to the notebook's defaults or drawing."""
@@ -76,6 +111,8 @@ def loops_only():
 def main():
     if "--loops" in sys.argv:
         return loops_only()
+    if "--examples" in sys.argv:
+        return examples()
     pieces = load_pieces()
     for slug, credit in PUBLIC.items():
         src = MASKS / slug

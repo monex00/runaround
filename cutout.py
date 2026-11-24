@@ -46,6 +46,7 @@ with app.setup:
 
     ROOT = Path(__file__).parent
     from runaround import (
+        BASE,
         MASKS,
         PAPER,
         Cutout,
@@ -55,6 +56,7 @@ with app.setup:
         Place,
         Runaround,
         Type,
+        asset_bytes,
         asset_text,
         clean_mask,
         glow_fill,
@@ -96,6 +98,11 @@ with app.setup:
 
     CLIPS = ROOT / "clips"
     WORK = MASKS / "cutout"  # apart from the pieces' masks/<slug>/, never committed
+    # Videos anyone may use, to start from (tools/make_demo.py --examples).
+    EXAMPLES = {
+        "Spring (Blender Studio, CC-BY 4.0)": dict(file="spring.mp4", line_art=False),
+        "Tango (The Gallopin' Gaucho, 1928, public domain)": dict(file="tango.mp4", line_art=True),
+    }
 
 
 @app.cell
@@ -117,8 +124,10 @@ def _(mo):
     it, and **SAM 2** follows each box through the shot. The masks are
     cleaned as `tools/masks.py` cleans them, then laid out on the page.
 
-    Use only clips you may use: your own, Blender's open movies (CC-BY,
-    credit them), public-domain cartoons.
+    It starts on an example, a shot from *Spring* (Blender Studio, 2019,
+    CC-BY 4.0); the other is *The Gallopin' Gaucho* (1928, public domain).
+    For your own, use only clips you may use: your own work, Blender's open
+    movies (CC-BY, credit them), public-domain cartoons.
     """)
     return
 
@@ -143,7 +152,12 @@ def _(mo):
     _local = sorted(p.name for p in CLIPS.iterdir() if p.is_file()) if CLIPS.exists() else []
     video_upload = mo.ui.anywidget(VideoDrop(WORK, Scan()))
     video_pick = mo.ui.dropdown(
-        ["", *_local], value="", label="or one from clips/" if _local else "(no clips/ here)"
+        {
+            **{k: f"example:{v['file']}" for k, v in EXAMPLES.items()},
+            **{f"{n} (clips/)": f"clip:{n}" for n in _local},
+        },
+        value=next(iter(EXAMPLES)),
+        label="or start from",
     )
     fps = mo.ui.dropdown({"12": 12, "24": 24}, value="12", label="frames a second")
     width = mo.ui.dropdown(
@@ -152,7 +166,7 @@ def _(mo):
     mo.vstack(
         [
             video_upload,
-            mo.hstack([video_pick, fps, width] if _local else [fps, width], justify="start"),
+            mo.hstack([video_pick, fps, width], justify="start"),
         ]
     )
     return fps, video_pick, video_upload, width
@@ -161,16 +175,23 @@ def _(mo):
 @app.cell
 def _(mo, video_pick, video_upload):
     # The source video on disk (an upload is kept in masks/cutout/<name>/).
+    old_cartoon = False
     if video_upload.value["path"]:
         source = Path(video_upload.value["path"])
         name = source.parent.name
     elif video_pick.value:
-        source = CLIPS / video_pick.value
-        name = slug(source.stem)
+        _kind, _file = video_pick.value.split(":", 1)
+        if _kind == "example":
+            source = example_video(_file)
+            name = f"example_{slug(source.stem)}"
+            old_cartoon = next(v["line_art"] for v in EXAMPLES.values() if v["file"] == _file)
+        else:
+            source = CLIPS / _file
+            name = slug(source.stem)
     else:
         mo.stop(True, mo.md("*Pick a video to start.*"))
     duration = video_duration(source)
-    return duration, name, source
+    return duration, name, old_cartoon, source
 
 
 @app.cell
@@ -276,7 +297,7 @@ def _(fps, frames, mo, shot, work):
 
 
 @app.cell
-def _(mo):
+def _(mo, old_cartoon):
     method = mo.ui.radio(
         {
             "SAM 2: follows the boxes": "sam2",
@@ -287,7 +308,7 @@ def _(mo):
         label="model",
     )
     line_art = mo.ui.checkbox(
-        value=False, label="black outlines on a light background (old cartoons)"
+        value=old_cartoon, label="black outlines on a light background (old cartoons)"
     )
     cut_run = mo.ui.run_button(label="cut out")
     mo.vstack([method, line_art, cut_run])
@@ -435,6 +456,20 @@ def video_duration(path):
     r = subprocess.run([ffmpeg(), "-i", str(path)], capture_output=True, text=True, check=False)
     h, m, s = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr).groups()
     return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+@app.function
+def example_video(file):
+    """An example video on disk: beside the notebook, or fetched once from the
+    published repository where a server copy lacks it (molab)."""
+    here = BASE / "demo" / "examples" / file
+    if here.exists():
+        return here
+    path = WORK / "examples" / file
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(asset_bytes(f"demo/examples/{file}"))
+    return path
 
 
 @app.function
