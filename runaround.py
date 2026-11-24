@@ -94,7 +94,7 @@ def _(mo):
     )
     upload = mo.ui.file(
         filetypes=[".png", ".webp", ".gif"],
-        label="your own cut-out (PNG or GIF)",
+        label="your own cut-out (PNG, WebP or GIF)",
     )
     text_pick = mo.ui.dropdown(
         {
@@ -627,12 +627,18 @@ def _(
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 6. Making a reel
+    ## 6. Your own figure
 
-    The same functions draw the reels, 1080×1920 for drafts and 2160×3840 for
-    the master, with `tools/render.py`. To cut a figure of your own out of a
-    video, `tools/masks.py` runs BiRefNet or SAM 2 on a GPU. Both are optional:
-    `uv sync --group reels`, then see the README.
+    Cutting a figure out of a video takes two segmentation models and a GPU,
+    more than a browser page can run. A second notebook does it on
+    [molab](https://molab.marimo.io), marimo's free cloud, which lends you
+    the GPU:
+
+    [![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/monex00/runaround/blob/main/cutout.py)
+
+    Pick a video and a shot, check the boxes around the figure, and it gives
+    the cut-out back as an animated WebP. Drop that file into *your own
+    cut-out* at the top of this page, and the text flows around your figure.
     """)
     return
 
