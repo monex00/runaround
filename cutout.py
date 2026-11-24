@@ -1045,7 +1045,7 @@ class ShotPicker(anywidget.AnyWidget):
           <figure><canvas data-f="b"></canvas><figcaption>last frame</figcaption></figure>
         </div>
         <div class="sp-read"><button type="button">play</button><span class="sp-time"></span><span class="sp-note"></span></div>
-        <div class="sp-label">the whole video: click a shot</div>
+        <div class="sp-label">the whole video: click to move the selection there, double-click to take a whole shot</div>
         <canvas class="sp-strip sp-all"></canvas>
         <div class="sp-label">this shot: drag the two ends, or the middle to move them together (arrow keys: a tenth of a second)</div>
         <canvas class="sp-strip sp-near" tabindex="0"></canvas>
@@ -1151,13 +1151,24 @@ class ShotPicker(anywidget.AnyWidget):
         if (playing) cancelAnimationFrame(playing);
         playing = 0; playT = null; play.textContent = "play";
       }
-      function pick(i) {
+      function fitIn(s, e) {  // a selection inside [s, e], or the shortest one around it
+        if (e - s < m.shortest) { e = near10(Math.min(dur, s + m.shortest)); s = near10(Math.max(0, e - m.shortest)); }
+        return [s, e];
+      }
+      function pick(i) {  // the whole shot i, as long as it may be
         stop();
         cur = i;
-        let s = up10(bounds[i]), e = down10(bounds[i + 1]);
+        let [s, e] = fitIn(up10(bounds[i]), down10(bounds[i + 1]));
         if (e - s > m.longest) e = near10(s + m.longest);
-        if (e - s < m.shortest) { e = near10(Math.min(dur, s + m.shortest)); s = near10(Math.max(0, e - m.shortest)); }
         a = s; b = e; setView(); draw(); commit();
+      }
+      function place(t) {  // the same length, centred on t, inside the shot at t
+        stop();
+        cur = shotAt(t);
+        const [s0, e0] = fitIn(up10(bounds[cur]), down10(bounds[cur + 1]));
+        const len = Math.min(b - a, e0 - s0);
+        a = near10(clamp(t - len / 2, s0, e0 - len)); b = near10(a + len);
+        setView(); draw(); commit();
       }
       function snap(t, which, perSec) {
         const reach = 6 / perSec;
@@ -1188,10 +1199,12 @@ class ShotPicker(anywidget.AnyWidget):
         showTip(e, all, t);
       });
       all.addEventListener("pointerleave", () => { hover = -1; drawAll(); hideTip(); });
-      all.addEventListener("click", (e) => {
+      const allT = (e) => {
         const r = all.getBoundingClientRect();
-        pick(shotAt(clamp(((e.clientX - r.left) / r.width) * dur, 0, dur)));
-      });
+        return clamp(((e.clientX - r.left) / r.width) * dur, 0, dur);
+      };
+      all.addEventListener("click", (e) => place(allT(e)));
+      all.addEventListener("dblclick", (e) => pick(shotAt(allT(e))));
 
       const nearT = (e) => {
         const r = near.getBoundingClientRect();
@@ -1201,7 +1214,9 @@ class ShotPicker(anywidget.AnyWidget):
         stop(); hideTip(); near.focus({ preventScroll: true }); near.setPointerCapture(e.pointerId);
         const r = near.getBoundingClientRect(), perSec = r.width / (view[1] - view[0]);
         const t = nearT(e), da = Math.abs(t - a) * perSec, db = Math.abs(t - b) * perSec;
-        if (Math.min(da, db) <= 12) drag = da <= db ? "a" : "b";
+        // a selection as long as the video cannot move: inside it, take the nearer end
+        const stuck = b - a >= down10(dur) - 0.05;
+        if (Math.min(da, db) <= 12 || (stuck && t > a && t < b)) drag = da <= db ? "a" : "b";
         else if (t > a && t < b) drag = { off: t - a, len: b - a };
         else drag = t < a ? "a" : "b";
         if (typeof drag === "string") { side = drag; move(e); }
